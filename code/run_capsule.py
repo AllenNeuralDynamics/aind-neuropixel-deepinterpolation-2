@@ -93,7 +93,7 @@ def create_fake_zarr_data(filepath, num_frames=1000, num_channels=384):
 # Custom Dataset with chunk-aligned subset
 class ZarrInterpolationDataset(Dataset):
     def __init__(self, zarr_path, array_name='traces_seg0', n_frames=2, chunk_size=30000, 
-                 sample_size=10, subset_size=10000):  # Reduced sample_size to 10
+                 sample_size=10, subset_size=10000):
         zarr_group = zarr.open(zarr_path, mode='r')
         try:
             self.zarr_data = zarr_group[array_name]
@@ -150,35 +150,16 @@ class ZarrInterpolationDataset(Dataset):
         return (torch.FloatTensor(norm_input_frames), 
                 torch.FloatTensor(norm_target_frame))
 
-# Training function with detached pos_scores
+# Training function with optimized DataLoader usage
 def train_model(model, dataloader, num_epochs=100):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
     
-    dataset = dataloader.dataset
-    subset_size = len(dataset)
-    batch_size = dataloader.batch_size
-    steps_per_epoch = (subset_size + batch_size - 1) // batch_size
-    
     for epoch in range(num_epochs):
         running_loss = 0.0
-        indices = np.random.permutation(subset_size)
-        print(f"Epoch {epoch+1}: Shuffled {len(indices)} indices")
-        
-        for batch_idx in range(steps_per_epoch):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, subset_size)
-            batch_indices = indices[start_idx:end_idx]
-            
-            inputs = []
-            targets = []
-            for idx in batch_indices:
-                input_frame, target_frame = dataset[idx]
-                inputs.append(input_frame)
-                targets.append(target_frame)
-            
-            inputs = torch.stack(inputs).to(device)
-            targets = torch.stack(targets).to(device)
+        for batch_idx, (inputs, targets) in enumerate(dataloader):
+            inputs = inputs.to(device)
+            targets = targets.to(device)
             
             optimizer.zero_grad()
             outputs, pos_scores = model(inputs)
@@ -192,17 +173,16 @@ def train_model(model, dataloader, num_epochs=100):
                 threshold = 0.01
                 active_positions = (pos_scores[0] > threshold).sum().item()
                 max_score = pos_scores[0].max().item()
-                print(f"Epoch {epoch+1}, Batch {batch_idx}/{steps_per_epoch-1}, Loss: {loss.item():.4f}")
+                print(f"Epoch {epoch+1}, Batch {batch_idx}/{len(dataloader)-1}, Loss: {loss.item():.4f}")
                 print(f"  Active grid positions (> {threshold}): {active_positions}/{model.grid_height * model.grid_width}")
                 print(f"  Max position score: {max_score:.4f}")
                 
-                # Detach pos_scores before converting to NumPy
                 grid = pos_scores[0].detach().cpu().numpy()
                 grid = grid.reshape(model.grid_height, model.grid_width)
                 print(f"  Grid ({model.grid_height}x{model.grid_width}, rounded to 3 decimals):")
                 print(np.round(grid, 3))
         
-        avg_loss = running_loss / steps_per_epoch
+        avg_loss = running_loss / len(dataloader)
         print(f'Epoch [{epoch+1}/{num_epochs}], Avg Loss: {avg_loss:.4f}')
 
 # Inference function (unchanged)
@@ -233,10 +213,11 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     N_FRAMES = 2
-    BATCH_SIZE = 4
+    BATCH_SIZE = 32  # Increased from 4
     SUBSET_SIZE = 10000
     CHUNK_SIZE = 30000
-    SAMPLE_SIZE = 10  # Reduced for faster testing
+    SAMPLE_SIZE = 10
+    NUM_WORKERS = 8  # Increased from 2
     ZARR_PATH = "/data/ecephys_660948_2023-05-01_20-02-08/ecephys_compressed/experiment1_Record Node 104#Neuropix-PXI-100.ProbeA.zarr"
     ARRAY_NAME = 'traces_seg0'
     
@@ -259,7 +240,8 @@ if __name__ == "__main__":
 
     dataset = ZarrInterpolationDataset(ZARR_PATH, array_name=ARRAY_NAME, n_frames=N_FRAMES, 
                                      chunk_size=CHUNK_SIZE, sample_size=SAMPLE_SIZE, subset_size=SUBSET_SIZE)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, 
+                           pin_memory=True if device.type == 'cuda' else False)
     
     net_library = InterpolationNetworkLibrary()
     model = net_library.sparse_unet_2d(in_channels=2*N_FRAMES, latent_size=1024, 

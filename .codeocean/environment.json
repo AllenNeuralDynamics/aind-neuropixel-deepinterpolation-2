@@ -9,7 +9,12 @@
 		"apt": {
 			"packages": [
 				{
-					"name": "htop"
+					"name": "htop",
+					"version": "3.0.5-7build2"
+				},
+				{
+					"name": "screen",
+					"version": "4.9.0-1"
 				}
 			],
 			"install_software_properties_common": true
@@ -23,10 +28,6 @@
 				{
 					"name": "numpy",
 					"version": "1.24.4"
-				},
-				{
-					"name": "torch",
-					"version": "2.4.1"
 				},
 				{
 					"name": "wavpack-numcodecs",
