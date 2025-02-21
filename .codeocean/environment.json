@@ -6,6 +6,14 @@
 		"git_ask_pass": true
 	},
 	"installers": {
+		"apt": {
+			"packages": [
+				{
+					"name": "htop"
+				}
+			],
+			"install_software_properties_common": true
+		},
 		"pip": {
 			"packages": [
 				{
