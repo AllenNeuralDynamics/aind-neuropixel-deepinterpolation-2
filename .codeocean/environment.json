@@ -1,7 +1,36 @@
 {
 	"version": 1,
-	"base_image": "codeocean/jupyterlab:3.0.9-miniconda4.9.2-python3.8-ubuntu20.04",
+	"base_image": "codeocean/pytorch-tensorflow-jax:2.1",
 	"options": {
+		"registry_host_arg": true,
 		"git_ask_pass": true
+	},
+	"installers": {
+		"pip": {
+			"packages": [
+				{
+					"name": "numcodecs[wavpack]",
+					"version": "0.12.1"
+				},
+				{
+					"name": "numpy",
+					"version": "1.24.4"
+				},
+				{
+					"name": "torch",
+					"version": "2.4.1"
+				},
+				{
+					"name": "wavpack-numcodecs",
+					"version": "0.2.2"
+				},
+				{
+					"name": "zarr",
+					"version": "2.16.1"
+				}
+			],
+			"options": {},
+			"pre_install_options": {}
+		}
 	}
 }
