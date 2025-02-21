@@ -213,7 +213,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     N_FRAMES = 2
-    BATCH_SIZE = 64  # Increased from 4
+    BATCH_SIZE = 256  # Increased from 4
     SUBSET_SIZE = 10000
     CHUNK_SIZE = 30000
     SAMPLE_SIZE = 10
