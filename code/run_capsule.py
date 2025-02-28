@@ -197,13 +197,13 @@ if __name__ == "__main__":
         print("Warning: 'wavpack' codec not available. Install with 'pip install numcodecs[wavpack]' if needed.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+    print(f"Device used: {device}")
     N_FRAMES = 2
     BATCH_SIZE = 128
     SUBSET_SIZE = 10000
     CHUNK_SIZE = 30000
     SAMPLE_SIZE = 10
-    NUM_WORKERS = 8
+    NUM_WORKERS = 2
     ZARR_PATH = "/data/ecephys_660948_2023-05-01_20-02-08/ecephys_compressed/experiment1_Record Node 104#Neuropix-PXI-100.ProbeA.zarr"
     ARRAY_NAME = 'traces_seg0'
     
