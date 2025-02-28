@@ -66,19 +66,50 @@ class InterpolationNetworkLibrary:
         return SparseUNet2D()
 
 # Function to transfer Zarr to memory-mapped file in parallel
+
+def load_chunk(zarr_data, memmap_data, shape, num_processes, chunk_idx):
+    """
+    Transfer a chunk of data from Zarr to the memory-mapped file.
+    
+    Args:
+        zarr_data: Zarr array to read from
+        memmap_data: Memory-mapped array to write to
+        shape: Shape of the full dataset
+        num_processes: Total number of processes
+        chunk_idx: Index of the current chunk
+    """
+    # Calculate start and end indices for this chunk
+    start = chunk_idx * (shape[0] // num_processes)
+    end = (chunk_idx + 1) * (shape[0] // num_processes) if chunk_idx < num_processes - 1 else shape[0]
+    
+    # Transfer the chunk
+    memmap_data[start:end] = zarr_data[start:end]
+    print(f"Transferred chunk {chunk_idx}: frames {start} to {end}")
+
 def transfer_zarr_to_memmap(zarr_data, memmap_path, num_processes=4):
+    """
+    Transfer Zarr data to a memory-mapped file using multiple processes.
+    
+    Args:
+        zarr_data: Zarr array to transfer
+        memmap_path: Path to the memory-mapped file
+        num_processes: Number of processes to use (default: 4)
+    
+    Returns:
+        memmap_data: The memory-mapped array
+    """
     shape = zarr_data.shape
     dtype = zarr_data.dtype
+    
+    # Create the memory-mapped file
     memmap_data = np.memmap(memmap_path, dtype=dtype, mode='w+', shape=shape)
     
-    def load_chunk(chunk_idx):
-        start = chunk_idx * (shape[0] // num_processes)
-        end = (chunk_idx + 1) * (shape[0] // num_processes) if chunk_idx < num_processes - 1 else shape[0]
-        memmap_data[start:end] = zarr_data[start:end]
-        print(f"Transferred chunk {chunk_idx}: frames {start} to {end}")
-    
+    # Use Pool to parallelize the transfer
     with Pool(processes=num_processes) as pool:
-        pool.map(load_chunk, range(num_processes))
+        # Prepare arguments for each process
+        args = [(zarr_data, memmap_data, shape, num_processes, i) for i in range(num_processes)]
+        # Use starmap to pass multiple arguments to load_chunk
+        pool.starmap(load_chunk, args)
     
     return memmap_data
 
