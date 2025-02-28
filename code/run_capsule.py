@@ -4,7 +4,8 @@ import numpy as np
 import zarr
 from torch.utils.data import Dataset, DataLoader
 import os
-import numcodecs
+import multiprocessing as mp
+from multiprocessing import Pool
 
 # Network Library with dense layer, no attention
 class InterpolationNetworkLibrary:
@@ -13,7 +14,6 @@ class InterpolationNetworkLibrary:
         class SparseUNet2D(nn.Module):
             def __init__(self):
                 super().__init__()
-                # Keep the dense layer, project directly to grid size
                 self.latent_proj = nn.Linear(384, grid_height * grid_width)
                 self.conv1 = nn.Conv2d(in_channels, 64, (3, 3), padding=1)
                 self.pool1 = nn.MaxPool2d((2, 2))
@@ -38,10 +38,8 @@ class InterpolationNetworkLibrary:
                 
             def forward(self, x):
                 batch_size = x.size(0)
-                # Project to grid size directly
                 latent = self.relu(self.latent_proj(x))
                 x_2d = latent.view(batch_size, in_channels, self.grid_height, self.grid_width)
-                
                 conv1 = self.relu(self.conv1(x_2d))
                 pool1 = self.pool1(conv1)
                 conv2 = self.relu(self.conv2(pool1))
@@ -67,65 +65,46 @@ class InterpolationNetworkLibrary:
         
         return SparseUNet2D()
 
-# Function to create fake zarr data (unchanged)
-def create_fake_zarr_data(filepath, num_frames=1000, num_channels=384):
-    clean_data = np.zeros((num_frames, num_channels), dtype=np.float32)
-    for t in range(num_frames):
-        clean_data[t] = np.sin(t * 0.1 + np.arange(num_channels) * 0.01)
+# Function to transfer Zarr to memory-mapped file in parallel
+def transfer_zarr_to_memmap(zarr_data, memmap_path, num_processes=4):
+    shape = zarr_data.shape
+    dtype = zarr_data.dtype
+    memmap_data = np.memmap(memmap_path, dtype=dtype, mode='w+', shape=shape)
     
-    noisy_data = clean_data + np.random.normal(0, 0.1, clean_data.shape)
+    def load_chunk(chunk_idx):
+        start = chunk_idx * (shape[0] // num_processes)
+        end = (chunk_idx + 1) * (shape[0] // num_processes) if chunk_idx < num_processes - 1 else shape[0]
+        memmap_data[start:end] = zarr_data[start:end]
+        print(f"Transferred chunk {chunk_idx}: frames {start} to {end}")
     
-    zarr_group = zarr.open(filepath, mode='w')
-    zarr_store = zarr_group.create_dataset('traces_seg0', shape=noisy_data.shape, 
-                                          chunks=(30000, num_channels), dtype='f4')
-    zarr_store[:] = noisy_data
-    return zarr_store
+    with Pool(processes=num_processes) as pool:
+        pool.map(load_chunk, range(num_processes))
+    
+    return memmap_data
 
-# Custom Dataset with optional in-memory loading
-class ZarrInterpolationDataset(Dataset):
-    def __init__(self, zarr_path, array_name='traces_seg0', n_frames=2, chunk_size=30000, 
-                 sample_size=10, subset_size=10000, load_to_memory=False):
-        zarr_group = zarr.open(zarr_path, mode='r')
-        try:
-            self.zarr_data = zarr_group[array_name]
-        except KeyError:
-            print(f"Available arrays in zarr group: {list(zarr_group.array_keys())}")
-            raise KeyError(f"Array '{array_name}' not found in zarr file {zarr_path}")
-        except ValueError as e:
-            if 'codec not available' in str(e):
-                print(f"Codec error: {e}. Please install required codec (e.g., 'pip install numcodecs[wavpack]')")
-            raise
-        
-        # Optionally load a portion (or all) of the data into memory
-        if load_to_memory:
-            print("Loading data into memory for faster access...")
-            self.zarr_data = self.zarr_data[:]
-        
+# Custom Dataset using memory-mapped file
+class MemMapInterpolationDataset(Dataset):
+    def __init__(self, memmap_path, shape, dtype, n_frames=2, subset_size=10000, sample_size=10):
+        self.memmap_data = np.memmap(memmap_path, dtype=dtype, mode='r', shape=shape)
         self.n_frames = n_frames
-        self.chunk_size = chunk_size
-        self.total_frames = self.zarr_data.shape[0]
-        
-        num_chunks = (self.total_frames - 2 * n_frames) // chunk_size
+        self.total_frames = shape[0]
         self.subset_size = min(subset_size, self.total_frames - 2 * n_frames)
-        num_subset_chunks = (self.subset_size + chunk_size - 1) // chunk_size
-        chunk_indices = np.random.choice(num_chunks, min(num_subset_chunks, num_chunks), replace=False)
-        self.valid_indices = []
-        for chunk_idx in chunk_indices:
-            start = chunk_idx * chunk_size + n_frames
-            end = min(start + chunk_size, self.total_frames - n_frames)
-            self.valid_indices.extend(range(start, end))
-        self.valid_indices = np.array(self.valid_indices[:self.subset_size])
-        print(f"Selected {len(self.valid_indices)} frames from {num_subset_chunks} chunks")
+        self.valid_indices = np.random.choice(
+            np.arange(n_frames, self.total_frames - n_frames),
+            size=self.subset_size,
+            replace=False
+        )
+        print(f"Selected {len(self.valid_indices)} frames for training")
         
         print("Computing normalization stats...")
         sample_indices = np.random.choice(self.total_frames, min(sample_size, self.total_frames), replace=False)
-        sample_data = np.array([self.zarr_data[i] for i in sample_indices])
+        sample_data = self.memmap_data[sample_indices]
         self.global_mean = np.mean(sample_data)
         self.global_std = np.std(sample_data)
         if self.global_std == 0:
             self.global_std = 1.0
         print(f"Global mean: {self.global_mean:.4f}, Global std: {self.global_std:.4f}")
-        
+    
     def __len__(self):
         return self.subset_size
     
@@ -134,10 +113,10 @@ class ZarrInterpolationDataset(Dataset):
         input_frames = []
         for j in range(-self.n_frames, self.n_frames + 1):
             if j != 0:
-                frame = self.zarr_data[center_idx + j]
+                frame = self.memmap_data[center_idx + j]
                 input_frames.append(frame)
         
-        target_frame = self.zarr_data[center_idx]
+        target_frame = self.memmap_data[center_idx]
         
         input_frames_np = np.stack(input_frames)
         norm_input_frames = (input_frames_np - self.global_mean) / self.global_std
@@ -146,7 +125,7 @@ class ZarrInterpolationDataset(Dataset):
         return (torch.FloatTensor(norm_input_frames), 
                 torch.FloatTensor(norm_target_frame))
 
-# Training function (unchanged)
+# Training function
 def train_model(model, dataloader, num_epochs=100):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
@@ -171,14 +150,14 @@ def train_model(model, dataloader, num_epochs=100):
         avg_loss = running_loss / len(dataloader)
         print(f'Epoch [{epoch+1}/{num_epochs}], Avg Loss: {avg_loss:.4f}')
 
-# Inference function (unchanged)
-def denoise_frame(model, data, frame_idx, n_frames, global_mean, global_std):
+# Inference function
+def denoise_frame(model, memmap_data, frame_idx, n_frames, global_mean, global_std):
     model.eval()
     with torch.no_grad():
         input_frames = []
         for j in range(-n_frames, n_frames + 1):
             if j != 0:
-                frame = data[frame_idx + j]
+                frame = memmap_data[frame_idx + j]
                 input_frames.append(frame)
         input_frames_np = np.stack(input_frames)
         
@@ -188,6 +167,67 @@ def denoise_frame(model, data, frame_idx, n_frames, global_mean, global_std):
         denoised = model(input_stack)
         denoised = denoised * global_std + global_mean
         return denoised.squeeze().cpu().numpy()
+
+# Main execution
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device used: {device}")
+    
+    # Configuration
+    N_FRAMES = 2
+    BATCH_SIZE = 128
+    SUBSET_SIZE = 10000
+    SAMPLE_SIZE = 10
+    NUM_WORKERS = 8  # Adjust based on CPU cores
+    ZARR_PATH = "/data/ecephys_660948_2023-05-01_20-02-08/ecephys_compressed/experiment1_Record Node 104#Neuropix-PXI-100.ProbeA.zarr"
+    ARRAY_NAME = 'traces_seg0'
+    MEMMAP_PATH = "/data/memmap_data.dat"  # Local path for memory-mapped file
+    NUM_PROCESSES = 10  # For parallel transfer
+    
+    # Step 1: Open Zarr and get array info
+    zarr_group = zarr.open(ZARR_PATH, mode='r')
+    zarr_data = zarr_group[ARRAY_NAME]
+    shape = zarr_data.shape
+    dtype = zarr_data.dtype
+    print(f"Zarr data shape: {shape}, dtype: {dtype}")
+    
+    # Step 2: Transfer Zarr to memory-mapped file in parallel
+    if not os.path.exists(MEMMAP_PATH):
+        print("Transferring Zarr to memory-mapped file...")
+        memmap_data = transfer_zarr_to_memmap(zarr_data, MEMMAP_PATH, num_processes=NUM_PROCESSES)
+    else:
+        print("Using existing memory-mapped file...")
+        memmap_data = np.memmap(MEMMAP_PATH, dtype=dtype, mode='r', shape=shape)
+    
+    # Step 3: Use memory-mapped file in dataset
+    dataset = MemMapInterpolationDataset(
+        MEMMAP_PATH, 
+        shape=shape, 
+        dtype=dtype, 
+        n_frames=N_FRAMES, 
+        subset_size=SUBSET_SIZE, 
+        sample_size=SAMPLE_SIZE
+    )
+    
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=NUM_WORKERS, 
+        pin_memory=True if device.type == 'cuda' else False
+    )
+    
+    net_library = InterpolationNetworkLibrary()
+    model = net_library.sparse_unet_2d(in_channels=2*N_FRAMES, grid_height=4, grid_width=96).to(device)
+    
+    train_model(model, dataloader)
+    
+    # For inference, use the memory-mapped data
+    test_frame_idx = 50
+    denoised_frame = denoise_frame(model, memmap_data, test_frame_idx, N_FRAMES, 
+                                   dataset.global_mean, dataset.global_std)
+    print(f"Denoised frame shape: {denoised_frame.shape}")
+
 
 # Main execution
 if __name__ == "__main__":
