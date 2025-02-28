@@ -6,20 +6,15 @@ from torch.utils.data import Dataset, DataLoader
 import os
 import numcodecs
 
-# Network Library (unchanged)
+# Network Library with dense layer, no attention
 class InterpolationNetworkLibrary:
     @staticmethod
-    def sparse_unet_2d(in_channels, out_channels=1, latent_size=1024, grid_height=4, grid_width=192):
+    def sparse_unet_2d(in_channels, out_channels=1, grid_height=4, grid_width=96):
         class SparseUNet2D(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.latent_proj = nn.Linear(384, latent_size)
-                self.pos_attention = nn.Sequential(
-                    nn.Linear(latent_size, latent_size),
-                    nn.ReLU(),
-                    nn.Linear(latent_size, grid_height * grid_width),
-                    nn.Softmax(dim=-1)
-                )
+                # Keep the dense layer, project directly to grid size
+                self.latent_proj = nn.Linear(384, grid_height * grid_width)
                 self.conv1 = nn.Conv2d(in_channels, 64, (3, 3), padding=1)
                 self.pool1 = nn.MaxPool2d((2, 2))
                 self.conv2 = nn.Conv2d(64, 128, (3, 3), padding=1)
@@ -43,13 +38,9 @@ class InterpolationNetworkLibrary:
                 
             def forward(self, x):
                 batch_size = x.size(0)
+                # Project to grid size directly
                 latent = self.relu(self.latent_proj(x))
-                pos_scores = self.pos_attention(latent.mean(dim=1))
-                x_2d = torch.zeros(batch_size, in_channels, self.grid_height, self.grid_width, 
-                                 device=x.device)
-                for i in range(batch_size):
-                    grid_flat = torch.einsum('cl,g->g', latent[i], pos_scores[i])
-                    x_2d[i] = grid_flat.view(1, self.grid_height, self.grid_width).expand(in_channels, -1, -1)
+                x_2d = latent.view(batch_size, in_channels, self.grid_height, self.grid_width)
                 
                 conv1 = self.relu(self.conv1(x_2d))
                 pool1 = self.pool1(conv1)
@@ -72,7 +63,7 @@ class InterpolationNetworkLibrary:
                 decoded = self.decoded(conv10)
                 decoded = decoded.view(batch_size, 1, -1)
                 out = self.final_dense(decoded)
-                return out.squeeze(1), pos_scores
+                return out.squeeze(1)
         
         return SparseUNet2D()
 
@@ -90,10 +81,10 @@ def create_fake_zarr_data(filepath, num_frames=1000, num_channels=384):
     zarr_store[:] = noisy_data
     return zarr_store
 
-# Custom Dataset with chunk-aligned subset
+# Custom Dataset with optional in-memory loading
 class ZarrInterpolationDataset(Dataset):
     def __init__(self, zarr_path, array_name='traces_seg0', n_frames=2, chunk_size=30000, 
-                 sample_size=10, subset_size=10000):
+                 sample_size=10, subset_size=10000, load_to_memory=False):
         zarr_group = zarr.open(zarr_path, mode='r')
         try:
             self.zarr_data = zarr_group[array_name]
@@ -104,6 +95,11 @@ class ZarrInterpolationDataset(Dataset):
             if 'codec not available' in str(e):
                 print(f"Codec error: {e}. Please install required codec (e.g., 'pip install numcodecs[wavpack]')")
             raise
+        
+        # Optionally load a portion (or all) of the data into memory
+        if load_to_memory:
+            print("Loading data into memory for faster access...")
+            self.zarr_data = self.zarr_data[:]
         
         self.n_frames = n_frames
         self.chunk_size = chunk_size
@@ -150,7 +146,7 @@ class ZarrInterpolationDataset(Dataset):
         return (torch.FloatTensor(norm_input_frames), 
                 torch.FloatTensor(norm_target_frame))
 
-# Training function with optimized DataLoader usage
+# Training function (unchanged)
 def train_model(model, dataloader, num_epochs=100):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
@@ -162,7 +158,7 @@ def train_model(model, dataloader, num_epochs=100):
             targets = targets.to(device)
             
             optimizer.zero_grad()
-            outputs, pos_scores = model(inputs)
+            outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
@@ -170,36 +166,26 @@ def train_model(model, dataloader, num_epochs=100):
             running_loss += loss.item()
             
             if batch_idx % 100 == 0:
-                threshold = 0.01
-                active_positions = (pos_scores[0] > threshold).sum().item()
-                max_score = pos_scores[0].max().item()
                 print(f"Epoch {epoch+1}, Batch {batch_idx}/{len(dataloader)-1}, Loss: {loss.item():.4f}")
-                print(f"  Active grid positions (> {threshold}): {active_positions}/{model.grid_height * model.grid_width}")
-                print(f"  Max position score: {max_score:.4f}")
-                
-                grid = pos_scores[0].detach().cpu().numpy()
-                grid = grid.reshape(model.grid_height, model.grid_width)
-                print(f"  Grid ({model.grid_height}x{model.grid_width}, rounded to 3 decimals):")
-                print(np.round(grid, 3))
         
         avg_loss = running_loss / len(dataloader)
         print(f'Epoch [{epoch+1}/{num_epochs}], Avg Loss: {avg_loss:.4f}')
 
 # Inference function (unchanged)
-def denoise_frame(model, zarr_data, frame_idx, n_frames, global_mean, global_std):
+def denoise_frame(model, data, frame_idx, n_frames, global_mean, global_std):
     model.eval()
     with torch.no_grad():
         input_frames = []
         for j in range(-n_frames, n_frames + 1):
             if j != 0:
-                frame = zarr_data[frame_idx + j]
+                frame = data[frame_idx + j]
                 input_frames.append(frame)
         input_frames_np = np.stack(input_frames)
         
         norm_input_frames = (input_frames_np - global_mean) / global_std
         
         input_stack = torch.FloatTensor(norm_input_frames).unsqueeze(0).to(device)
-        denoised, _ = model(input_stack)
+        denoised = model(input_stack)
         denoised = denoised * global_std + global_mean
         return denoised.squeeze().cpu().numpy()
 
@@ -213,20 +199,22 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     N_FRAMES = 2
-    BATCH_SIZE = 256  # Increased from 4
+    BATCH_SIZE = 128
     SUBSET_SIZE = 10000
     CHUNK_SIZE = 30000
     SAMPLE_SIZE = 10
-    NUM_WORKERS = 8  # Increased from 2
+    NUM_WORKERS = 8
     ZARR_PATH = "/data/ecephys_660948_2023-05-01_20-02-08/ecephys_compressed/experiment1_Record Node 104#Neuropix-PXI-100.ProbeA.zarr"
     ARRAY_NAME = 'traces_seg0'
     
+    # If the zarr file doesn't exist, create fake data
     if not os.path.exists(ZARR_PATH):
         print("Creating fake zarr data...")
         create_fake_zarr_data(ZARR_PATH)
     else:
         print("Using existing zarr data...")
     
+    # Open the zarr group to check its contents
     zarr_group = zarr.open(ZARR_PATH, mode='r')
     print("Zarr group contents:", list(zarr_group.array_keys()))
     try:
@@ -238,20 +226,37 @@ if __name__ == "__main__":
         print("Likely a codec issue. Please ensure 'wavpack' is installed if required.")
         raise
 
-    dataset = ZarrInterpolationDataset(ZARR_PATH, array_name=ARRAY_NAME, n_frames=N_FRAMES, 
-                                     chunk_size=CHUNK_SIZE, sample_size=SAMPLE_SIZE, subset_size=SUBSET_SIZE)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, 
-                           pin_memory=True if device.type == 'cuda' else False)
+    # Set these to test in-memory loading. 
+    # Optionally, specify a memory_range (start, end) to load only a portion.
+    LOAD_TO_MEMORY = True
+    
+    dataset = ZarrInterpolationDataset(
+        ZARR_PATH, 
+        array_name=ARRAY_NAME, 
+        n_frames=N_FRAMES, 
+        chunk_size=CHUNK_SIZE, 
+        sample_size=SAMPLE_SIZE, 
+        subset_size=SUBSET_SIZE,
+        load_to_memory=LOAD_TO_MEMORY,
+    )
+    
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=NUM_WORKERS, 
+        pin_memory=True if device.type == 'cuda' else False
+    )
     
     net_library = InterpolationNetworkLibrary()
-    model = net_library.sparse_unet_2d(in_channels=2*N_FRAMES, latent_size=1024, 
-                                     grid_height=4, grid_width=192).to(device)
+    model = net_library.sparse_unet_2d(in_channels=2*N_FRAMES, grid_height=4, grid_width=96).to(device)
     
     train_model(model, dataloader)
     
-    zarr_data = zarr.open(ZARR_PATH, mode='r')[ARRAY_NAME]
+    # For inference, you can also use the in-memory data from the dataset
+    # Here we use dataset.zarr_data which is now in memory if LOAD_TO_MEMORY is True
     test_frame_idx = 50
-    denoised_frame = denoise_frame(model, zarr_data, test_frame_idx, N_FRAMES, 
-                                 dataset.global_mean, dataset.global_std)
+    denoised_frame = denoise_frame(model, dataset.zarr_data, test_frame_idx, N_FRAMES, 
+                                   dataset.global_mean, dataset.global_std)
     
     print(f"Denoised frame shape: {denoised_frame.shape}")
